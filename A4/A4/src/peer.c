@@ -388,6 +388,31 @@ void handle_register(int connfd, char* client_ip, int client_port_int)
 {
     // Your code here. This function has been added as a guide, but feel free 
     // to add more, or work in other parts of the code
+    
+    //check to see if ip and port is already a peer.
+    for(int i = 0; i < peer_count; i++){
+        if(strcmp(network[i]->ip, client_ip) == 0 && atoi(network[i]->port == client_port_int)){
+
+            //sending appropriate response
+            ReplyHeader_t peer_exists_response = {htol(0), htonl(STATUS_PEER_EXISTS), 0, 0};
+            send(connfd, &peer_exists_response, sizeof(peer_exists_response), 0);
+            return;
+        }
+
+        //add peer to network
+        //lock mutex to avoid race condition
+        pthread_mutex_lock(&network_mutex);
+        network = realloc(network, (peer_count +1) * sizeof(PeerAddress_t*));
+        PeerAddress_t* new_peer = malloc(sizeof(PeerAddress_t));
+        strncpy(new_peer->ip, client_ip, IP_LEN);
+        snprintf(new_peer->port, PORT_LEN, "%d", client_port_int);
+        network[peer_count++] = new_peer;
+        pthread_mutex_unlock(&network_mutex);
+
+        //reply with appropriate status (OK)
+        ReplyHeader_t reply = { htonl(0), htonl(STATUS_OK), 0, 0 };
+        send(connfd, &reply, sizeof(reply), 0);
+    }
 }
 
 /*
