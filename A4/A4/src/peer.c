@@ -16,6 +16,22 @@
 #include "./peer.h"
 #include "./sha256.h"
 
+#define COMMAND_REGISTER 1
+#define COMMAND_INFORM 2
+#define COMMAND_RETREIVE 3
+
+#define STATUS_OK 0
+#define STATUS_PEER_EXISTS 1
+#define STATUS_FILE_NOT_FOUND 2
+#define STATUS_ERROR 3
+
+#define MAX_MSG_LEN 1024
+#define REQUEST_HEADER_LEN sizeof(RequestHeader_t)
+#define REPLY_HEADER_LEN sizeof(ReplyHeader_t)
+
+
+
+
 
 // Global variables to be used by both the server and client side of the peer.
 // Some of these are not currently used but should be considered STRONG hints
@@ -390,11 +406,11 @@ void handle_register(int connfd, char* client_ip, int client_port_int)
     // to add more, or work in other parts of the code
     
     //check to see if ip and port is already a peer.
-    for(int i = 0; i < peer_count; i++){
-        if(strcmp(network[i]->ip, client_ip) == 0 && atoi(network[i]->port == client_port_int)){
+    for(uint32_t i = 0; i < peer_count; i++){
+        if(strcmp(network[i]->ip, client_ip) == 0 && atoi(network[i]->port) == client_port_int){
 
             //sending appropriate response
-            ReplyHeader_t peer_exists_response = {htol(0), htonl(STATUS_PEER_EXISTS), 0, 0};
+            ReplyHeader_t peer_exists_response = {htonl(0), htonl(STATUS_PEER_EXISTS), 0, 0};
             send(connfd, &peer_exists_response, sizeof(peer_exists_response), 0);
             return;
         }
@@ -423,6 +439,14 @@ void handle_inform(char* request)
 {
     // Your code here. This function has been added as a guide, but feel free 
     // to add more, or work in other parts of the code
+
+    pthread_mutex_lock(&retrieving_mutex);
+
+    FilePath_t* new_file = malloc(sizeof(FilePath_t));
+    strncpy(new_file->path, request, PATH_LEN);
+    retrieving_files = realloc(retrieving_files, (file_count +1) * sizeof(FilePath_t));
+    retrieving_files[file_count++] = new_file;
+    pthread_mutex_unlock(&retrieving_mutex);
 }
 
 /*
@@ -433,6 +457,48 @@ void handle_retreive(int connfd, char* request)
 {
     // Your code here. This function has been added as a guide, but feel free 
     // to add more, or work in other parts of the code
+
+    // Check if the requested file exists
+    FILE* fp = fopen(request, "rb");
+    if (!fp) {
+        // Send STATUS_FILE_NOT_FOUND
+        ReplyHeader_t reply = { htonl(0), htonl(STATUS_FILE_NOT_FOUND), 0, 0 };
+        send(connfd, &reply, sizeof(reply), 0);
+        return;
+    }
+
+    // Get size of file
+    fseek(fp, 0, SEEK_END);
+    uint32_t file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    uint32_t block_count = ceil((double)file_size / (MAX_MSG_LEN - REPLY_HEADER_LEN));
+    hashdata_t total_hash;
+    get_file_sha(request, total_hash, SHA256_HASH_SIZE);
+
+    for (uint32_t i = 0; i < block_count; i++) {
+        uint32_t this_block_size = min(file_size - i * (MAX_MSG_LEN - REPLY_HEADER_LEN),
+                                       MAX_MSG_LEN - REPLY_HEADER_LEN);
+        char buffer[this_block_size];
+        fread(buffer, this_block_size, 1, fp);
+
+        hashdata_t block_hash;
+        get_data_sha(buffer, block_hash, this_block_size, SHA256_HASH_SIZE);
+
+        // create and send the reply header
+        ReplyHeader_t reply = {
+            htonl(this_block_size), htonl(STATUS_OK), htonl(i), htonl(block_count)
+        };
+        memcpy(reply.block_hash, block_hash, SHA256_HASH_SIZE);
+        memcpy(reply.total_hash, total_hash, SHA256_HASH_SIZE);
+
+        send(connfd, &reply, REPLY_HEADER_LEN, 0);
+
+        // Send the payload
+        send(connfd, buffer, this_block_size, 0);
+    }
+
+    fclose(fp);
 }
 
 /*
@@ -443,6 +509,34 @@ void handle_server_request_thread(int connfd)
 {
     // Your code here. This function has been added as a guide, but feel free 
     // to add more, or work in other parts of the code
+
+    char buffer[MAX_MSG_LEN];
+    recv(connfd, buffer, REQUEST_HEADER_LEN, 0);
+
+    RequestHeader_t* request_header = (RequestHeader_t*)buffer;
+    char client_ip[IP_LEN];
+    strncpy(client_ip, request_header->ip, IP_LEN);
+    int client_port = ntohl(request_header->port);
+    int command = ntohl(request_header->command);
+
+    char request_body[MAX_MSG_LEN - REQUEST_HEADER_LEN];
+    recv(connfd, request_body, ntohl(request_header->length), 0);
+
+    switch (command) {
+        case COMMAND_REGISTER:
+            handle_register(connfd, client_ip, client_port);
+            break;
+        case COMMAND_INFORM:
+            handle_inform(request_body);
+            break;
+        case COMMAND_RETREIVE:
+            handle_retreive(connfd, request_body);
+            break;
+        default:
+            printf("Unknown command: %d\n", command);
+    }
+
+    close(connfd);
 }
 
 /*
@@ -453,6 +547,25 @@ void* server_thread()
 {
     // Your code here. This function has been added as a guide, but feel free 
     // to add more, or work in other parts of the code
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in server_addr;
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(atoi(my_address->port));
+    inet_pton(AF_INET, my_address->ip, &server_addr.sin_addr);
+
+    bind(listen_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    listen(listen_fd, 10);
+
+    while (1) {
+        int connfd = accept(listen_fd, NULL, NULL);
+        pthread_t handler_thread;
+        pthread_create(&handler_thread, NULL, (void* (*)(void*))handle_server_request_thread, &connfd);
+        pthread_detach(handler_thread);
+    }
+    close(listen_fd);
+    return NULL;
 }
 
 
